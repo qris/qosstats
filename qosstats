@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+if (@ARGV < 1)
+{
+	die "Usage: $0 <interface>\n";
+}
+
+my @interfaces = @ARGV;
+
+foreach my $if (@interfaces)
+{
+	my ($queue, $type, $backlogb, $backlogp, %backlog);
+	my ($qdisc, $class, $parent, $prio, $rate, $ceil, $burst, $cburst);
+	my ($sentb, $sentp, $dropped, $over, $aratep, $arateb);
+
+	# open TC, "/sbin/tc -s qdisc show dev $if |" or die "failed to open tc: $!";
+
+	while (0) # my $line = <TC>)
+	{
+		# qdisc pfifo_fast 0: dev tun2 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+		#  Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+		#  rate 0bit 0pps backlog 0b 0p requeues 0 
+
+		my $line;
+		chomp $line;
+		if ($line =~ m|^qdisc (\S+) (\S+) |)
+		{
+			if ($queue)
+			{
+				$backlog{$queue} = [$type, $backlogb, $backlogp];
+			}
+			$type = $1;
+			$queue = $2;
+		}
+		elsif ($line =~ m|^ Sent |)
+		{
+			# nothing to see here, move along
+		}
+		elsif ($line =~ m|^ .* backlog (\d+)b (\d+)p requeues \d+|)
+		{
+			$backlogb = $1;
+			$backlogp = $2;
+		}
+		else
+		{
+			warn "Unparsed line in tc qdisc output: $line";
+		}
+	}
+	# $backlog{$queue} = [$type, $backlogb, $backlogp];
+
+	close TC;
+	open TC, "/sbin/tc -s class show dev $if |" or die "failed to open tc: $!";
+
+	my @classes;
+
+	sub normalise ($)
+	{
+		my ($value) = @_;
+		$value =~ m/^(\d+)(K|M|)(bit|bps)/ or die "bad format: $value";
+		my $bits = $1;
+		$bits *= 1000 if $2 eq "K";
+		$bits *= 1000 if $2 eq "M";
+		$bits *= 8    if $3 eq "bps";
+		$bits /= 1000; # convert to kbps
+		$bits = int($bits);
+		return $bits;
+	}
+
+	while (my $line = <TC>)
+	{
+		chomp $line;
+		if ($line =~ m|^class |)
+		{
+			if ($class)
+			{
+				push @classes, 
+					[ $class, $parent, $prio, $rate, $ceil, $burst,
+					  $sentp, $dropped, $over, $arateb, $aratep, $qdisc,
+					  $backlogb, $backlogp ];
+			}
+
+			# class htb 1:12 parent 1:1 rate 200Kbit ceil 200Kbit burst 5Kb cburst 1855b
+			# class htb 1:1 root rate 100Mbit ceil 100Mbit burst 5098b cburst 132644b
+			$line =~ m'^class (htb|red) (.*) (root|parent [0-9:]+) (leaf [0-9:]+ )?(prio (\d+) )?rate (.*) ceil (.*) burst (.*) cburst (.*) *$' 
+				or die "bad format in class line: $line";
+
+			$qdisc  = $1;
+			$class  = $2;
+			$parent = $3;
+			$prio   = $6;
+			$rate   = $7;
+			$ceil   = $8;
+			$burst  = $9;
+			$cburst = $10;
+
+			$rate = normalise($rate);
+			$ceil = normalise($ceil);
+
+			if ($parent eq "root")
+			{
+				undef $parent;
+			}
+			else
+			{
+				die unless $parent =~ m|^parent (.*)( leaf (.*))?$|;
+				$parent = $1;
+			}
+
+			undef $sentb;
+			undef $sentp;
+			undef $dropped;
+			undef $over;
+			undef $arateb;
+			undef $aratep;
+		}
+		elsif ($line =~ m|^ Sent |)
+		{
+			#  Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+			$line =~ m|^ Sent (.*) bytes (.*) pkt(s?) \(dropped (.*), overlimits (\d+)( requeues \d+)?\) *$|
+				or die "bad format in Sent line: '$line'";
+			$sentb   = $1;
+			$sentp   = $2;
+			$dropped = $4;
+			$over    = $5;
+		}
+		elsif ($line =~ m|^ rate |)
+		{
+			# rate 18250bps 14pps backlog 8p
+			# rate 12000bit 5pps
+			# rate 0bit 0pps backlog 0b 0p requeues 0
+			$line =~ m'^ rate ([^ ]+)( (.*)pps)?( backlog ((\d+)b )?(\d+)p)?( requeues \d+)? *$' 
+				or die "bad format in rate line: $line";
+			$arateb = normalise($1);
+			$aratep = $3;
+			$backlogb = $6;
+			$backlogp = $7;
+		}
+		elsif ($line =~ m|^ lended: |)
+		{
+			# ignore
+		}
+		elsif ($line =~ m|^ tokens: |)
+		{
+			# ignore
+		}
+		elsif ($line =~ m|^ backlog |)
+		{
+			# ignore
+		}
+		elsif ($line =~ m|\S|)
+		{
+			warn "Unknown line: $line";
+		}
+	}
+
+	push @classes,
+		[ $class, $parent, $prio, $rate, $ceil, $burst,
+		  $sentp, $dropped, $over, $arateb, $aratep, $qdisc,
+		  $backlogb, $backlogp ];
+
+	close TC;
+
+	@classes = sort {$a->[0] cmp $b->[0]} @classes;
+
+	exit 0 unless @classes;
+
+	my $header = sprintf "%-5s %-5s %-4s %5s %8s %6s %9s %8s %8s %6s %4s",
+		"Class", "Paren", "Prio", "Rate", "Ceil", "Burst",
+		"Sent", "Dropped", "Backlog", "kbps", "Pps";
+
+	print "$if\n$header\n";
+	print "=" x length $header, "\n";
+
+	foreach my $class (@classes)
+	{
+		my ($cnum, $parent, $prio, $rate, $ceil, $burst, $sentp, $dropped, 
+			$over, $arateb, $aratep, $qdisc, $backlogb, $backlogp) = @$class;
+
+		$parent ||= "-";
+		$prio = "-" if not defined $prio;
+		$arateb ||= "-";
+		$aratep ||= "-";
+
+		printf "%-5s %-5s %-1s %8s %8s %6s %9s %8s %8s %6s %4s\n",
+			$cnum, $parent, $prio, $rate, $ceil, $burst,
+			$sentp, $dropped, $backlogb."b/".$backlogp."p",
+			$arateb, $aratep;
+	}
+
+	print "\n";
+}
+
+exit 0;
