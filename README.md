@@ -53,9 +53,16 @@ uplink (outside) devices respectively.
 
 Then set `DOWNLINK` and `UPLINK` to about half the bandwidth that you
 expect to get, and play with them while downloading and uploading large
-amounts until you get good responsiveness to pings (low latency).
+amounts until you get good responsiveness to pings (low latency). You'll
+need to rerun the `wshaper` script after every change. `watch` the output
+of `qosstats` and a `ping` while you do it.
+
 Typically you would get that at 60-80% of maximum capacity, depending
-on how your connection works.
+on how your connection works. Getting closer to your theoretical maximum
+is likely to increase delays of all traffic; reducing limits reduces the
+worst-case delays while also reducing your maximum download and upload
+speed; therefore you have to choose your tradeoff carefully to suit your
+needs.
 
 Tests done on the firewall itself will not reveal the effects of
 traffic shaping on the inside interface `DDEV`, so you will need to
