@@ -1,0 +1,491 @@
+#!/bin/bash
+# Wonder Shaper
+# please read the README before filling out these values 
+#
+# Set the following values to somewhat less than your actual download
+# and uplink speed. In kilobits. Also set the device that is to be shaped.
+DOWNLINK=120 # known good
+# DOWNLINK=150
+# DOWNLINK=200
+# DOWNLINK=250 # ok when throttled
+# DOWNLINK=300 # not ok when throttled
+# DOWNLINK=350
+# DOWNLINK=400 # known good
+# DOWNLINK=600 # known OK most of the time, not when throttled
+# DOWNLINK=800
+# DOWNLINK=1200 # known OK most of the time
+# DOWNLINK=1400 # known OK most of the time
+# DOWNLINK=1500 # known OK most of the time
+# DOWNLINK=900 # sopmetimes slow
+# DOWNLINK=1000 # known slow (sometimes)
+# DOWNLINK=1500
+# DOWNLINK=1800
+#DOWNLINK=2000 # known slow when throttled, otherwise ok
+DOWNLINK=9000 # known slow when throttled, otherwise ok
+DOWNLINK=18000 # maybe OK after upgrade
+# UPLINK=80 # known good
+# UPLINK=100
+UPLINK=100 # seems to be OK even when throttled
+UPLINK=110
+# UPLINK=130 # seems to be OK, not when throttled
+# UPLINK=140
+# UPLINK=200
+#UPLINK=250 # seems to be OK most of the time, not when throttled
+UPLINK=300 # known slow with lots of high priority traffic (was OK for ages)
+UPLINK=600 # maybe OK after upgrade
+#UPLINK=350
+#UPLINK=400
+#UPLINK=500 # seems ok recently, when not throttled
+# UPLINK=1000
+UDEV=eth1
+
+# Parameters for second network interface
+DDEV=eth0
+DOWNLINK2=$[$DOWNLINK*8/10]
+UPLINK2=$[$UPLINK*9/10]
+
+bulkrate=$[$DOWNLINK/2]
+# in case bulk downloads interfere with skype:
+# bulkrate=500
+maxrate=$DOWNLINK
+hour=`date '+%H'`
+
+if [ $hour -ge 10 -a $hour -lt 15 ]; then
+	# 2400 MB / 5 hours = 480 MB/hour = 8 MB/min = 64 Mb/min ~ 1000 kbps
+	# 6000 MB / 5 hours = 1200 MB/hour = 20 MB/min = 2666 kbps
+	# bulkrate=800
+	# maxrate=1000
+	bulkrate=2000
+	# maxrate=2600
+elif [ $hour -ge 15 -a $hour -lt 21 ]; then
+	# 1200 MB / 5 hours = 240 MB/hour = 4 MB/min = 32 Mb/min ~ 500 kbps
+	# 3000 MB / 5 hours = 600 MB/hour = 10 MB/min = 1333 kbps
+	# bulkrate=350
+	# maxrate=450
+	bulkrate=1000
+	# maxrate=1300
+fi
+
+TC=/sbin/tc
+
+if [ "$1" = "status" ]
+then
+	echo "Uplink ($UDEV):"
+	$TC -s qdisc ls dev $UDEV
+	$TC -s class ls dev $UDEV
+	echo
+	echo "Downlink ($DDEV):"
+	$TC -s qdisc ls dev $DDEV
+	$TC -s class ls dev $DDEV
+	exit
+fi
+
+LOCKFILE=/var/run/wshaper.pid
+if [ -r "$LOCKFILE" ]; then
+	OTHERPID=`cat $LOCKFILE`
+	if [ -n "$OTHERPID" -a -d "/proc/$OTHERPID" ]; then
+		echo "Another wshaper is already running with pid $OTHERPID"
+		exit 2
+	fi
+
+	echo "Removing stale lockfile $LOCKFILE for $OTHERPID"
+	rm $LOCKFILE
+fi
+echo $$ > $LOCKFILE
+
+# clean existing down- and uplink qdiscs, hide errors
+$TC qdisc del dev $UDEV root    2> /dev/null > /dev/null
+$TC qdisc del dev $UDEV ingress 2> /dev/null > /dev/null
+
+$TC qdisc del dev $DDEV root    2> /dev/null > /dev/null
+$TC qdisc del dev $DDEV ingress 2> /dev/null > /dev/null
+
+iptables='/sbin/iptables'
+
+old_blocked=`mktemp /tmp/blocked.XXXXXX`
+$iptables -t filter -L blocked > $old_blocked
+
+$iptables -t nat -F blocked
+$iptables -t filter -F blocked
+$iptables -t filter -F throttle
+
+if [ "$1" = "stop" ] 
+then 
+	rm $LOCKFILE
+	exit
+fi
+
+# blocking
+
+echo '
+SELECT ip_src, sum(bytes) as b, "uploaded"
+FROM acct_v7
+WHERE stamp_inserted > CONCAT(LEFT(NOW(), 10), " 15:00")
+AND   stamp_inserted < CONCAT(LEFT(NOW(), 10), " 20:00")
+AND   hour(now()) < 20
+AND   ip_src <> "0.0.0.0"
+AND   ip_src <> "192.168.0.1"
+AND   ip_dst <> "192.168.0.1"
+AND   bytes < 100000000
+GROUP BY ip_src
+HAVING b > 1000000000;
+
+SELECT ip_dst, sum(bytes) as b, "downloaded 1000-1500"
+FROM acct_v7
+WHERE stamp_inserted > CONCAT(LEFT(NOW(), 10), " 10:00")
+AND   stamp_inserted < CONCAT(LEFT(NOW(), 10), " 15:00")
+AND   hour(now()) < 15
+AND   ip_dst <> "0.0.0.0"
+AND   ip_dst <> "192.168.0.1"
+AND   ip_src <> "192.168.0.1"
+AND   bytes < 100000000
+GROUP BY ip_dst
+HAVING b > 4000000000;
+
+SELECT ip_dst, sum(bytes) as b, "downloaded 1600-2100"
+FROM acct_v7
+WHERE stamp_inserted > CONCAT(LEFT(NOW(), 10), " 16:00")
+AND   stamp_inserted < CONCAT(LEFT(NOW(), 10), " 21:00")
+AND   hour(now()) < 21
+AND   ip_dst <> "0.0.0.0"
+AND   ip_dst <> "192.168.0.1"
+AND   ip_dst <> "192.168.0.113"
+AND   ip_src <> "192.168.0.1"
+AND   bytes < 100000000
+GROUP BY ip_dst
+HAVING b > 1600000000;
+' | mysql pmacct -u root -N | while read ip bytes direction; do
+	blocking="$blocking : blocking $ip for $bytes bytes $direction"
+	$iptables -A blocked -s $ip -d 192.168.0.1 -p tcp \
+		-m multiport --dports 53,81 -j ACCEPT
+	$iptables -A blocked -s $ip -d 192.168.0.1 -p udp \
+		--dport 53 -j ACCEPT
+	$iptables -A blocked -s $ip -j REJECT
+	$iptables -A blocked -d $ip -s 192.168.0.1 -p tcp \
+		-m multiport --sports 53,81 -j ACCEPT
+	$iptables -A blocked -d $ip -s 192.168.0.1 -p udp \
+		--sport 53 -j ACCEPT
+	$iptables -A blocked -d $ip -j REJECT
+	$iptables -t nat -A blocked -s $ip -p tcp --dport 80 \
+		-j DNAT --to-dest 192.168.0.1:81
+done
+
+new_blocked=`mktemp /tmp/blocked.XXXXXX`
+$iptables -t filter -L blocked > $new_blocked
+if ! diff -u $old_blocked $new_blocked; then
+	echo "Blocking changed: $blocking"
+fi
+
+rm $old_blocked $new_blocked
+
+###### uplink
+
+# install root HTB, point default traffic to 1:20:
+
+$TC qdisc add dev $UDEV root handle 1: htb default 20
+
+# shape everything at $UPLINK speed - this prevents huge queues in your
+# DSL modem which destroy latency:
+
+$TC class add dev $UDEV parent 1: classid 1:1 htb \
+	rate ${UPLINK}kbit burst 16k \
+	quantum 1500
+
+# high prio class 1:10:
+
+$TC class add dev $UDEV parent 1:1 classid 1:10 htb rate \
+	$[${UPLINK}/2]kbit ceil ${UPLINK}kbit burst 8k \
+	prio 1 quantum 1500
+
+# bulk & default class 1:20 - gets slightly less traffic, 
+# and a lower priority:
+
+$TC class add dev $UDEV parent 1:1 classid 1:20 htb \
+	rate $[${UPLINK}/4]kbit ceil $[${UPLINK}/2]kbit \
+	burst 6k prio 2 quantum 1500
+
+# backups
+
+$TC class add dev $UDEV parent 1:1 classid 1:30 htb \
+	rate 50kbit ceil $[(${UPLINK}*2)/4]kbit burst 6k prio 3 quantum 1500
+
+# everything else
+
+$TC class add dev $UDEV parent 1:1 classid 1:40 htb \
+	rate 50kbit ceil $[${UPLINK}/2]kbit burst 6k prio 3 quantum 1500
+
+# all get Stochastic Fairness:
+$TC qdisc add dev $UDEV parent 1:10 handle 10: sfq perturb 10
+$TC qdisc add dev $UDEV parent 1:20 handle 20: sfq perturb 10
+$TC qdisc add dev $UDEV parent 1:30 handle 30: sfq perturb 10
+$TC qdisc add dev $UDEV parent 1:40 handle 40: sfq perturb 10
+
+# TOS Minimum Delay (ssh, NOT scp) in 1:10:
+
+# iptables='/usr/local/sbin/iptables'
+$iptables -t mangle -F
+
+mangle() {
+	$iptables -t mangle -A POSTROUTING $1 -j CLASSIFY --set-class 1:$2
+	# $iptables -t mangle -A POSTROUTING $1 -j MARK --set-mark 0x$2
+}
+
+#$TC filter add dev $UDEV parent 1:0 protocol ip prio 10 u32 \
+#      match ip tos 0x10 0xff  flowid 1:10
+
+# default 1:40
+mangle "-o $UDEV" 40
+
+# mangle "-o $UDEV -m tos --tos 0x08" 30
+
+# voip
+mangle "-o $UDEV -p udp -m length --length 0:250" 10 # voip
+mangle "-o $UDEV -p tcp -m length --length 0:100" 20 # acks
+
+mangle "-o $UDEV -p tcp --dport 80" 20
+mangle "-o $UDEV -p tcp --sport 80" 20
+mangle "-o $UDEV -p tcp --dport 443" 20
+mangle "-o $UDEV -p tcp --sport 3000" 20
+mangle "-o $UDEV -p tcp --sport 4949" 20 # munin-node
+mangle "-o $UDEV -p tcp --dport 5666" 20 # nrpe
+mangle "-o $UDEV -p tcp --dport imaps" 10
+mangle "-o $UDEV -p tcp --dport imap" 10
+mangle "-o $UDEV -p tcp --dport smtp" 10
+
+mangle "-o $UDEV -m tos --tos 0x10" 10 # interactive
+mangle "-o $UDEV -m tos --tos 0x0 -p tcp --dport 48001" 10 # unknown
+mangle "-o $UDEV -m tos --tos 0x8 -p tcp --dport 48001" 30 # bulk
+mangle "-o $UDEV -m tos --tos 0x0 -p tcp --sport 48001" 10
+mangle "-o $UDEV -m tos --tos 0x0 -p tcp --sport 8080" 10
+mangle "-o $UDEV -m tos --tos 0x0 -p tcp --dport 22" 10
+mangle "-o $UDEV -p tcp --dport 5902" 10 # vnc
+mangle "-o $UDEV -p tcp --dport 5903" 10 # vnc
+mangle "-o $UDEV -p tcp --dport 3389" 10 # rdp
+mangle "-o $UDEV -p icmp" 10
+mangle "-o $UDEV -d 72.21.192.0/19" 30 # backups to Amazon S3
+
+filter() {
+	$iptables -A throttle -i $UDEV "$@"
+	# $iptables -t mangle -A POSTROUTING $1 -j MARK --set-mark 0x$2
+}
+
+filter -p tcp --sport 80 -j throttle_hi
+filter -p tcp --sport 443 -j throttle_hi
+filter -p tcp --sport 993 -j throttle_hi
+filter -p tcp --sport 48001 -m tos --tos 0x10 -j throttle_hi
+filter -p tcp --dport 48001 -m tos --tos 0x10 -j throttle_hi
+filter -p tcp -j throttle_lo
+
+#$TC filter add dev $UDEV parent 1:0 protocol ip prio 11 u32 \
+#      match ip tos 0x08 0xff  flowid 1:30
+
+
+# ICMP (ip protocol 1) in the interactive class 1:10 so we 
+# can do measurements & impress our friends:
+#$TC filter add dev $UDEV parent 1:0 protocol ip prio 10 u32 \
+#        match ip protocol 1 0xff flowid 1:10
+
+#mangle "-o $UDEV -p icmp" 10
+
+# To speed up downloads while an upload is going on, put ACK packets in
+# the interactive class:
+
+#$TC filter add dev $UDEV parent 1: protocol ip prio 10 u32 \
+#   match ip protocol 6 0xff \
+#   match u8 0x05 0x0f at 0 \
+#   match u16 0x0000 0xffc0 at 2 \
+#   match u8 0x10 0xff at 33 \
+#   flowid 1:10
+
+# mangle "-o $UDEV -p tcp --tcp-flags SYN,PSH,ACK ACK" 10
+
+#mangle "-o $UDEV -m length --length 0:200" 10
+#mangle "-o $UDEV -m length --length 200:1600" 30
+#mangle "-o $UDEV -p tcp --dport 48001" 20
+# mangle "-o $UDEV -p icmp" 10
+
+# rest is 'non-interactive' ie 'bulk' and ends up in 1:20 by default
+
+# some traffic however suffers a worse fate
+#for port in $NOPRIOPORTDST
+#do
+#	#$TC filter add dev $UDEV parent 1: protocol ip prio 14 u32 \
+#	#   match ip dport $port 0xffff flowid 1:30
+#	mangle "-o $UDEV -p tcp --dport $port" 30
+#	mangle "-o $UDEV -p udp --dport $port" 30
+#done
+#
+#for port in $NOPRIOPORTSRC
+#do
+# 	#$TC filter add dev $UDEV parent 1: protocol ip prio 15 u32 \
+#	#   match ip sport $a 0xffff flowid 1:30
+#	mangle "-o $UDEV -p tcp --sport $port" 30
+#	mangle "-o $UDEV -p udp --sport $port" 30
+#done
+#
+#for host in $NOPRIOHOSTSRC
+#do
+# 	#$TC filter add dev $UDEV parent 1: protocol ip prio 16 u32 \
+#	#   match ip src $a flowid 30
+#	mangle "-o $UDEV -s $host" 30
+#done
+#
+#for host in $NOPRIOHOSTDST
+#do
+# 	#$TC filter add dev $UDEV parent 1: protocol ip prio 17 u32 \
+#	#   match ip dst $a flowid 30
+#	mangle "-o $UDEV -d $host" 30
+#done
+#
+## rest is 'non-interactive' ie 'bulk' and ends up in 1:20
+#
+##$TC filter add dev $UDEV parent 1: protocol ip prio 18 u32 \
+#   match ip dst 0.0.0.0/0 flowid 1:20
+
+#$iptables -t mangle -A POSTROUTING -p tcp -m mark --mark 0x10 \
+#	-m limit --limit 1/s -j LOG
+
+#$iptables -t mangle -A POSTROUTING -m mark --mark 0x10 \
+#	-j TOS --set-tos 0x10
+
+#$iptables -t mangle -A POSTROUTING -m mark --mark 0x20 \
+#	-j TOS --set-tos 0x08
+
+#$iptables -t mangle -A POSTROUTING -m mark --mark 0x30 \
+#	-j TOS --set-tos 0x08
+
+########## downlink to us #############
+
+# slow downloads down to somewhat less than the real speed  to prevent 
+# queuing at our ISP. Tune to see how high you can set it.
+# ISPs tend to have *huge* queues to make sure big downloads are fast
+#
+# attach ingress policer:
+
+$TC qdisc add dev $UDEV ingress handle ffff:
+
+# filter *everything* to it (0.0.0.0/0), drop everything that's
+# coming in too fast:
+
+$TC filter add dev $UDEV parent ffff: protocol ip prio 50 u32 match ip src \
+   0.0.0.0/0 police rate ${maxrate}kbit burst 10k drop flowid :1
+
+###### downlink to computers behind us
+
+if true; then
+
+# install root HTB, point default traffic to 1:130 (bulk)
+
+$TC qdisc add dev $DDEV root handle 1: htb default 130
+
+# shape everything at $DOWNLINK2 speed - this prevents huge queues in your
+# DSL modem which destroy latency:
+
+$TC class add dev $DDEV parent 1: classid 1:1 htb rate 100mbit \
+	ceil 100mbit burst 6k quantum 1500
+
+$TC class add dev $DDEV parent 1:1 classid 1:10 htb rate ${DOWNLINK2}kbit \
+	ceil ${DOWNLINK2}kbit burst 6k quantum 1500
+
+$TC class add dev $DDEV parent 1:1 classid 1:11 htb rate 100mbit \
+	ceil 100mbit burst 6k quantum 1500
+
+# high prio class 1:10:
+
+$TC class add dev $DDEV parent 1:10 classid 1:110 htb rate $[${DOWNLINK2}/4]kbit \
+   ceil ${DOWNLINK2}kbit burst 6k prio 1 quantum 1500
+
+# bulk & default class 1:20 - gets slightly less traffic, 
+# and a lower priority:
+
+$TC class add dev $DDEV parent 1:10 classid 1:120 htb \
+	rate 8bps ceil ${DOWNLINK2}kbit burst 2k prio 2 quantum 1500
+
+$TC class add dev $DDEV parent 1:10 classid 1:130 htb \
+	rate 8bps ceil ${bulkrate}kbit burst 2k prio 3 quantum 1500
+
+$TC class add dev $DDEV parent 1:10 classid 1:140 htb \
+	rate 8bps ceil $[${bulkrate}/2]kbit burst 2k prio 3 quantum 1500
+
+# all get Stochastic Fairness:
+$TC qdisc add dev $DDEV parent 1:110 handle 10: sfq perturb 10
+$TC qdisc add dev $DDEV parent 1:120 handle 20: sfq perturb 10
+$TC qdisc add dev $DDEV parent 1:130 handle 30: sfq perturb 10
+$TC qdisc add dev $DDEV parent 1:140 handle 40: sfq perturb 10
+
+# default is bulk (1:30)
+
+mangle "-o $DDEV" 130
+
+# TOS Minimum Delay (ssh, NOT scp) in 1:110:
+
+mangle "-o $DDEV -m tos --tos 0x10" 110 # interactive
+mangle "-o $DDEV -m tos --tos 0x08" 130 # bulk
+
+mangle "-o $DDEV -p tcp --sport 80" 120
+mangle "-o $DDEV -p tcp --sport 443" 120
+mangle "-o $DDEV -p tcp --sport 5903" 110 # vnc
+mangle "-o $DDEV -p tcp --sport imaps" 120
+mangle "-o $DDEV -p tcp --sport imap" 120
+mangle "-o $DDEV -p tcp --sport smtp" 120
+mangle "-o $DDEV -p udp -m length --length 0:100" 110 # voip
+mangle "-o $DDEV -p tcp -m length --length 0:100" 110 # TCP acks
+mangle "-o $DDEV -s 192.168.0.1" 11 # local
+
+# eric bulk
+mangle "-o $DDEV -d 192.168.0.175" 140 # eri
+mangle "-o $DDEV -d 192.168.0.115" 140 # rob
+
+# $TC filter add dev $DDEV parent 1:0 protocol ip prio 10 u32 \
+#       match ip tos 0x10 0xff  flowid 1:10
+
+# ICMP (ip protocol 1) in the interactive class 1:10 so we 
+# can do measurements & impress our friends:
+# $TC filter add dev $DDEV parent 1:0 protocol ip prio 10 u32 \
+#         match ip protocol 1 0xff flowid 1:10
+
+# To speed up downloads while an upload is going on, put ACK packets in
+# the interactive class:
+
+#$TC filter add dev $DDEV parent 1: protocol ip prio 10 u32 \
+#   match ip protocol 6 0xff \
+#   match u8 0x05 0x0f at 0 \
+#   match u16 0x0000 0xffc0 at 2 \
+#   match u8 0x10 0xff at 33 \
+#   flowid 1:10
+
+# rest is 'non-interactive' ie 'bulk' and ends up in 1:20
+
+# some traffic however suffers a worse fate
+#for a in $NOPRIOPORTDST
+#do
+#	$TC filter add dev $DDEV parent 1: protocol ip prio 14 u32 \
+#	   match ip dport $a 0xffff flowid 1:30
+#done
+#
+#for a in $NOPRIOPORTSRC
+#do
+# 	$TC filter add dev $DDEV parent 1: protocol ip prio 15 u32 \
+#	   match ip sport $a 0xffff flowid 1:30
+#done
+#
+#for a in $NOPRIOHOSTSRC
+#do
+# 	$TC filter add dev $DDEV parent 1: protocol ip prio 16 u32 \
+#	   match ip src $a flowid 1:30
+#done
+#
+#for a in $NOPRIOHOSTDST
+#do
+# 	$TC filter add dev $DDEV parent 1: protocol ip prio 17 u32 \
+#	   match ip dst $a flowid 1:30
+#done
+#
+## rest is 'non-interactive' ie 'bulk' and ends up in 1:20
+#
+#$TC filter add dev $DDEV parent 1: protocol ip prio 18 u32 \
+#   match ip dst 0.0.0.0/0 flowid 1:20
+#
+fi
+
+rm $LOCKFILE
