@@ -59,6 +59,7 @@ foreach my $if (@interfaces)
 	sub normalise ($)
 	{
 		my ($value) = @_;
+		return undef if !defined($value);
 		$value =~ m/^(\d+)(K|M|)(bit|bps)/ or die "bad format: $value";
 		my $bits = $1;
 		$bits *= 1000 if $2 eq "K";
@@ -84,18 +85,19 @@ foreach my $if (@interfaces)
 
 			# class htb 1:12 parent 1:1 rate 200Kbit ceil 200Kbit burst 5Kb cburst 1855b
 			# class htb 1:1 root rate 100Mbit ceil 100Mbit burst 5098b cburst 132644b
-			$line =~ m'^class (htb|red) (.*) (root|parent [0-9:]+) (leaf [0-9:]+ )?(prio (\d+) )?rate (.*) ceil (.*) burst (.*) cburst (.*) *$' 
+			# class red 20:1 parent 20:
+			$line =~ m'^class (htb|red) (.*) (root|parent [0-9:]+) (leaf [0-9:]+ )?(prio (\d+) )?(rate (.*) ceil (.*) burst (.*) cburst (.*) *)?$' 
 				or die "bad format in class line: $line";
 
 			$qdisc  = $1;
 			$class  = $2;
 			$parent = $3;
 			$prio   = $6;
-			$rate   = $7;
-			$ceil   = $8;
-			$burst  = $9;
-			$cburst = $10;
-
+			$rate   = $8;
+			$ceil   = $9;
+			$burst  = $10;
+			$cburst = $11;
+				
 			$rate = normalise($rate);
 			$ceil = normalise($ceil);
 
@@ -161,8 +163,84 @@ foreach my $if (@interfaces)
 		  $sentp, $dropped, $over, $arateb, $aratep, $qdisc,
 		  $backlogb, $backlogp ];
 
+	$class = undef;
+	$parent = undef;
+	$prio = undef;
+	$rate = undef;
+	$ceil = undef;
+	$burst = undef;
+	$sentp = undef;
+	$dropped = undef;
+	$over = undef;
+	$arateb = undef;
+	$aratep = undef;
+	$qdisc = undef;
+	$backlogb = undef;
+	$backlogp = undef;
+
 	close TC;
 
+	open TC, "/sbin/tc -s qdisc show dev $if |" or die "failed to open tc: $!";
+	while (my $line = <TC>)
+	{
+		# qdisc ingress ffff: dev eth0 ---------------- 
+		# qdisc htb 1: dev eth1 r2q 10 default 20 direct_packets_stat 0
+		# qdisc red 20: parent 1:20 limit 100000b min 10000b max 25000b
+		# qdisc pfifo_fast 0: dev tun0 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+		if ($line =~ m'^qdisc (\w+) (\S+) (.*)$')
+		{
+			$qdisc = $1;
+			$class = $2;
+			my $params = $3;
+
+			if ($qdisc eq 'red')
+			{
+				if ($params =~ m'^(parent (\S+) )?limit (\d+)b min (\d+)b max (\d+)b')
+				{
+					$parent = $2;
+					$rate = $4;
+					$ceil = $5;
+				}
+				else
+				{
+					die "unable to parse RED parameters: '$params'";
+				}
+			}
+			# Ignore all other qdiscs, because their stats aren't useful
+		}
+		#  Sent 388541225 bytes 260528 pkt (dropped 650, overlimits 650 requeues 0) 
+		#  rate 0bit 0pps backlog 0b 0p requeues 0 
+		#   marked 0 early 650 pdrop 0 other 0
+		elsif (defined $qdisc and $qdisc eq 'red')
+		{
+			if ($line =~ m'^ Sent (\d+) bytes (\d+) pkt \(dropped (\d+), overlimits (\d+) requeues (\d+)\)')
+			{
+				$sentp = $2;
+				$dropped = $3;
+			}
+			elsif ($line =~ m'^ rate (\d+)bit (\d+)pps backlog (\d+)b (\d+)p requeues (\d+)')
+			{
+				$arateb = $1;
+				$aratep = $2;
+				$backlogb = $3;
+				$backlogp = $4;
+			}
+			elsif ($line =~ m'^  marked ')
+			{
+				# Save the info that we've gathered.
+				push @classes,
+					[ $class, $parent, $prio, $rate, $ceil, $burst,
+					  $sentp, $dropped, $over, $arateb, $aratep, $qdisc,
+					  $backlogb, $backlogp ];
+			}
+		}
+		else
+		{
+			# Ignore all status lines for other classes
+		}
+	}
+	close TC;
+	
 	@classes = sort {$a->[0] cmp $b->[0]} @classes;
 
 	exit 0 unless @classes;
@@ -181,6 +259,14 @@ foreach my $if (@interfaces)
 
 		$parent ||= "-";
 		$prio = "-" if not defined $prio;
+		$rate = "-" if not defined $rate;
+		$ceil = "-" if not defined $ceil;
+		$burst = "-" if not defined $burst;
+		$sentp = "-" if not defined $sentp;
+		$dropped = "-" if not defined $dropped;
+		$backlogb = "-" if not defined $backlogb;
+		$backlogp = "-" if not defined $backlogp;
+
 		$arateb ||= "-";
 		$aratep ||= "-";
 
