@@ -23,48 +23,82 @@ DOWNLINK=120 # known good
 #DOWNLINK=2000 # known slow when throttled, otherwise ok
 DOWNLINK=9000 # known slow when throttled, otherwise ok
 DOWNLINK=18000 # maybe OK after upgrade
+DOWNLINK=20000 # maybe OK after upgrade
+DOWNLINK=5000 # Zen
+DOWNLINK=11000 # Plusnet ADSL
+DOWNLINK=33000 # Plusnet Fibre
 # UPLINK=80 # known good
 # UPLINK=100
 UPLINK=100 # seems to be OK even when throttled
 UPLINK=110
 # UPLINK=130 # seems to be OK, not when throttled
 # UPLINK=140
-# UPLINK=200
+UPLINK=200
 #UPLINK=250 # seems to be OK most of the time, not when throttled
-UPLINK=300 # known slow with lots of high priority traffic (was OK for ages)
+#UPLINK=300 # known slow with lots of high priority traffic (was OK for ages)
 UPLINK=600 # maybe OK after upgrade
+UPLINK=900 # maybe OK after upgrade
+UPLINK=1100 # maybe OK after upgrade
+UPLINK=500 # Zen
+UPLINK=380 # Plusnet - too slow
+UPLINK=800 # Plusnet - a little slow at 920kbit
+UPLINK=750 # Plusnet - a little slow at 920kbit - ADSL best
+UPLINK=2000 # Plusnet Fibre
+# UPLINK=1400 # testing cw 130313; 600 was OK; 2000 is too much. even this seems to be too much - over quota? cw 130829
 #UPLINK=350
 #UPLINK=400
 #UPLINK=500 # seems ok recently, when not throttled
 # UPLINK=1000
-UDEV=eth1
+
+#eval `/home/chris/projects/munin-st516/adsl.expect | grep 'Payload rate' | sed -e 's/.*://' | awk '{ print "DOWNLINK=" $1 "\nUPLINK=" $2 }'`
+#DOWNLINK=$[$DOWNLINK*9/10]
+#UPLINK=$[$UPLINK*9/10]
+
+UDEV=eth0
 
 # Parameters for second network interface
-DDEV=eth0
-DOWNLINK2=$[$DOWNLINK*8/10]
+DDEV=eth1
 UPLINK2=$[$UPLINK*9/10]
+burst=1k
+perturb=60
 
-bulkrate=$[$DOWNLINK/2]
+# bulkrate is applied to the uplink device, so it's a fraction of maximum
+# uplink speed.
+bulkrate=$[$UPLINK*19/20]
 # in case bulk downloads interfere with skype:
 # bulkrate=500
-maxrate=$DOWNLINK
 hour=`date '+%H'`
 
+if false; then
 if [ $hour -ge 10 -a $hour -lt 15 ]; then
 	# 2400 MB / 5 hours = 480 MB/hour = 8 MB/min = 64 Mb/min ~ 1000 kbps
+	# 6000 MB / 5 hours = 1200 MB/hour = 20 MB/min = 2666 kbps
 	# 6000 MB / 5 hours = 1200 MB/hour = 20 MB/min = 2666 kbps
 	# bulkrate=800
 	# maxrate=1000
 	bulkrate=2000
-	# maxrate=2600
-elif [ $hour -ge 15 -a $hour -lt 21 ]; then
+elif [ $hour -ge 15 -a $hour -lt 20 ]; then
 	# 1200 MB / 5 hours = 240 MB/hour = 4 MB/min = 32 Mb/min ~ 500 kbps
 	# 3000 MB / 5 hours = 600 MB/hour = 10 MB/min = 1333 kbps
+	# 1750 MB / 5 hours = 350 MB/hour = 5.8 MB/min = 733 kbps
 	# bulkrate=350
 	# maxrate=450
-	bulkrate=1000
-	# maxrate=1300
+	bulkrate=600
 fi
+
+if [ $hour -ge 17 -a $hour -lt 22 ]; then
+	# 3500 MB / 5 hours = 700 MB/hour = 11.7 MB/min = 93 Mb/min ~ 1500 kbps
+	DOWNLINK=1500
+fi
+
+# already exceeded bandwidth limit
+if [ `date --rfc-3339=date` = "2014-04-28" ]; then
+	bulkrate=75
+	DOWNLINK=200
+fi
+fi
+
+DOWNLINK2=$[$DOWNLINK]
 
 TC=/sbin/tc
 
@@ -117,7 +151,7 @@ fi
 
 # blocking
 
-echo '
+if false; then echo '
 SELECT ip_src, sum(bytes) as b, "uploaded"
 FROM acct_v7
 WHERE stamp_inserted > CONCAT(LEFT(NOW(), 10), " 15:00")
@@ -169,6 +203,7 @@ HAVING b > 1600000000;
 	$iptables -t nat -A blocked -s $ip -p tcp --dport 80 \
 		-j DNAT --to-dest 192.168.0.1:81
 done
+fi
 
 new_blocked=`mktemp /tmp/blocked.XXXXXX`
 $iptables -t filter -L blocked > $new_blocked
@@ -178,49 +213,78 @@ fi
 
 rm $old_blocked $new_blocked
 
+q_local=2
+q_hiprio=10
+q_general=20
+q_backups=30
+q_unknown=40
+
 ###### uplink
 
 # install root HTB, point default traffic to 1:20:
 
-$TC qdisc add dev $UDEV root handle 1: htb default 20
+$TC qdisc add dev $UDEV root handle 1: htb default $q_general
 
 # shape everything at $UPLINK speed - this prevents huge queues in your
 # DSL modem which destroy latency:
 
 $TC class add dev $UDEV parent 1: classid 1:1 htb \
-	rate ${UPLINK}kbit burst 16k \
+	rate ${UPLINK}kbit burst $burst \
+	quantum 1500
+
+$TC class add dev $UDEV parent 1: classid 1:$q_local htb \
+	rate 100mbit burst $burst \
 	quantum 1500
 
 # high prio class 1:10:
 
-$TC class add dev $UDEV parent 1:1 classid 1:10 htb rate \
-	$[${UPLINK}/2]kbit ceil ${UPLINK}kbit burst 8k \
+$TC class add dev $UDEV parent 1:1 classid 1:$q_hiprio htb rate \
+	$[$UPLINK/3]kbit ceil ${UPLINK}kbit burst $burst \
 	prio 1 quantum 1500
 
 # bulk & default class 1:20 - gets slightly less traffic, 
 # and a lower priority:
 
-$TC class add dev $UDEV parent 1:1 classid 1:20 htb \
-	rate $[${UPLINK}/4]kbit ceil $[${UPLINK}/2]kbit \
-	burst 6k prio 2 quantum 1500
+$TC class add dev $UDEV parent 1:1 classid 1:$q_general htb \
+	rate $[$UPLINK/3]kbit ceil ${UPLINK}kbit \
+	burst $burst prio 2 quantum 1500
 
 # backups
 
-$TC class add dev $UDEV parent 1:1 classid 1:30 htb \
-	rate 50kbit ceil $[(${UPLINK}*2)/4]kbit burst 6k prio 3 quantum 1500
+# limit backups to amazon to avoid being throttled by Virgin
+firsthour=15
+lasthour=20
+seconds=$[($lasthour - $firsthour) * 3600]
+allowance=$[1750*1000]
+maxrate=$[$allowance * 8 / $seconds]
+if [ $maxrate -gt $UPLINK2 ]; then
+	maxrate=$UPLINK2
+fi
+
+bulkceil=$bulkrate
+if [ "$bulkrate" -gt $[$UPLINK/3] ]; then
+	bulkrate=$[$UPLINK/3]
+fi
+
+hour=`date +%H`
+#if [ $hour -ge $firsthour -a $hour -lt $lasthour ]; then
+	$TC class add dev $UDEV parent 1:1 classid 1:$q_backups htb \
+		rate ${bulkrate}kbit ceil ${bulkceil}kbit burst $burst prio 3 quantum 1500
+#else
+#	$TC class add dev $UDEV parent 1:1 classid 1:30 htb \
+#		rate $[$UPLINK/3]kbit ceil ${UPLINK2}kbit burst 6k prio 3 quantum 1500
+#fi
 
 # everything else
 
-$TC class add dev $UDEV parent 1:1 classid 1:40 htb \
-	rate 50kbit ceil $[${UPLINK}/2]kbit burst 6k prio 3 quantum 1500
+$TC class add dev $UDEV parent 1:1 classid 1:$q_unknown htb \
+	rate 8bps ceil $[${UPLINK2}]kbit burst 6k prio 3 quantum 1500
 
 # all get Stochastic Fairness:
-$TC qdisc add dev $UDEV parent 1:10 handle 10: sfq perturb 10
-$TC qdisc add dev $UDEV parent 1:20 handle 20: sfq perturb 10
-$TC qdisc add dev $UDEV parent 1:30 handle 30: sfq perturb 10
-$TC qdisc add dev $UDEV parent 1:40 handle 40: sfq perturb 10
-
-# TOS Minimum Delay (ssh, NOT scp) in 1:10:
+#$TC qdisc add dev $UDEV parent 1:10 handle 10: sfq perturb $perturb
+#$TC qdisc add dev $UDEV parent 1:20 handle 20: sfq perturb $perturb
+#$TC qdisc add dev $UDEV parent 1:30 handle 30: sfq perturb $perturb
+#$TC qdisc add dev $UDEV parent 1:40 handle 40: sfq perturb $perturb
 
 # iptables='/usr/local/sbin/iptables'
 $iptables -t mangle -F
@@ -230,39 +294,116 @@ mangle() {
 	# $iptables -t mangle -A POSTROUTING $1 -j MARK --set-mark 0x$2
 }
 
+create_classify_chain() {
+    name="classify_$1"
+    class=$2
+    $iptables -t mangle -X $name >/dev/null 1>&1
+    $iptables -t mangle -N $name
+    $iptables -t mangle -A $name -j CLASSIFY --set-class 1:$class
+    $iptables -t mangle -A $name -j ULOG --ulog-prefix "$name ($class)"
+    $iptables -t mangle -A $name -j ACCEPT
+}
+
+create_classify_chain local     $q_local
+create_classify_chain hiprio    $q_hiprio
+create_classify_chain general   $q_general
+create_classify_chain backups   $q_backups
+create_classify_chain unknown   $q_unknown
+
+classify() {
+    class=$1
+    shift
+
+    case "$*" in
+    "-o "*)
+	$iptables -t mangle -A POSTROUTING $@ -j classify_$class
+	$iptables -t mangle -A OUTPUT $@ -j classify_$class
+	;;
+    "-i "*)
+	$iptables -t mangle -A INPUT $@ -j classify_$class
+	;;
+    esac
+}
+
+
 #$TC filter add dev $UDEV parent 1:0 protocol ip prio 10 u32 \
 #      match ip tos 0x10 0xff  flowid 1:10
 
 # default 1:40
-mangle "-o $UDEV" 40
+# mangle "-o $UDEV" 40
 
+# TOS Minimum Delay (ssh, NOT scp) in 1:10:
 # mangle "-o $UDEV -m tos --tos 0x08" 30
 
+classify local "-i $DDEV -d 192.168.0.1" # local
+classify local "-i $DDEV -d gcc.flexdns.net" # local
+
+# icmp goes to different classes depending on TOS, 1:123 by default
+# ping -Q16 tests low latency, ping -Q0 tests normal traffic, ping -Q8 tests low priority
+classify hiprio "-o $UDEV -p icmp -m tos --tos Minimize-Delay"       # 0x10
+classify hiprio "-o $UDEV -p icmp -m tos --tos Maximize-Reliability" # 0x4
+classify general "-o $UDEV -p icmp -m tos --tos Normal-Service"       # 0x0
+classify backups "-o $UDEV -p icmp -m tos --tos Maximize-Throughput"  # 0x8
+classify unknown "-o $UDEV -p icmp -m tos --tos Minimize-Cost"        # 0x2
+
+# Amazon EC2 and S3 backups
+for network in \
+	23.20.0.0/14 \
+	37.72.170.168/29 \
+	46.51.178.186/18 \
+	50.16.0.0/14 \
+	54.192.0.0/12 \
+	54.208.0.0/12 \
+	54.224.0.0/12 \
+	72.21.192.0/19 \
+	107.20.0.0/14 \
+	108.160.160.0/20 \
+	176.32.96.0/21 \
+	176.34.240.0/21 \
+	205.251.192.0/18 \
+	207.171.160.0/19
+do
+	classify backups "-o $UDEV -d $network"
+	classify backups "-o $DDEV -s $network"
+done
+
+# Dropbox
+for network in \
+	45.58.64.0/20 \
+	108.160.160.0/20 \
+	54.80.0.0/12 \
+	54.72.0.0/13 \
+	38.121.104.0/24
+do
+	classify backups "-o $UDEV -d $network"
+	classify backups "-o $DDEV -s $network"
+done
+
 # voip
-mangle "-o $UDEV -p udp -m length --length 0:250" 10 # voip
-mangle "-o $UDEV -p tcp -m length --length 0:100" 20 # acks
+classify hiprio "-o $UDEV -p udp -m length --length 0:250" # voip
+classify hiprio "-o $UDEV -p tcp -m length --length 0:100" # acks
 
-mangle "-o $UDEV -p tcp --dport 80" 20
-mangle "-o $UDEV -p tcp --sport 80" 20
-mangle "-o $UDEV -p tcp --dport 443" 20
-mangle "-o $UDEV -p tcp --sport 3000" 20
-mangle "-o $UDEV -p tcp --sport 4949" 20 # munin-node
-mangle "-o $UDEV -p tcp --dport 5666" 20 # nrpe
-mangle "-o $UDEV -p tcp --dport imaps" 10
-mangle "-o $UDEV -p tcp --dport imap" 10
-mangle "-o $UDEV -p tcp --dport smtp" 10
+classify general "-o $UDEV -p tcp --dport 80"
+classify general "-o $UDEV -p tcp --sport 80"
+classify general "-o $UDEV -p tcp --dport 443"
+classify general "-o $UDEV -p tcp --sport 3000"
+classify general "-o $UDEV -p tcp --sport 4949" # munin-node
+classify general "-o $UDEV -p tcp --dport 5666" # nrpe
+classify backups "-o $UDEV -p tcp --dport imaps"
+classify general "-o $UDEV -p tcp --dport imap"
+classify general "-o $UDEV -p tcp --dport smtp"
 
-mangle "-o $UDEV -m tos --tos 0x10" 10 # interactive
-mangle "-o $UDEV -m tos --tos 0x0 -p tcp --dport 48001" 10 # unknown
-mangle "-o $UDEV -m tos --tos 0x8 -p tcp --dport 48001" 30 # bulk
-mangle "-o $UDEV -m tos --tos 0x0 -p tcp --sport 48001" 10
-mangle "-o $UDEV -m tos --tos 0x0 -p tcp --sport 8080" 10
-mangle "-o $UDEV -m tos --tos 0x0 -p tcp --dport 22" 10
-mangle "-o $UDEV -p tcp --dport 5902" 10 # vnc
-mangle "-o $UDEV -p tcp --dport 5903" 10 # vnc
-mangle "-o $UDEV -p tcp --dport 3389" 10 # rdp
-mangle "-o $UDEV -p icmp" 10
-mangle "-o $UDEV -d 72.21.192.0/19" 30 # backups to Amazon S3
+classify hiprio "-o $UDEV -m tos --tos 0x10" # interactive
+classify hiprio "-o $UDEV -m tos --tos 0x0 -p tcp --dport 48001" # unknown
+classify backups "-o $UDEV -m tos --tos 0x8 -p tcp --dport 48001" # bulk
+classify hiprio "-o $UDEV -m tos --tos 0x0 -p tcp --sport 48001"
+classify hiprio "-o $UDEV -m tos --tos 0x0 -p tcp --sport 8080"
+classify hiprio "-o $UDEV -m tos --tos 0x0 -p tcp --dport 22"
+classify hiprio "-o $UDEV -p tcp --dport 5902" # vnc
+classify hiprio "-o $UDEV -p tcp --dport 5903" # vnc
+classify hiprio "-o $UDEV -p tcp --dport 3389" # rdp
+classify backups "-o $UDEV -p tcp --sport 51413" # bittorrent
+classify backups "-o $UDEV -p udp --sport 51413" # bittorrent
 
 filter() {
 	$iptables -A throttle -i $UDEV "$@"
@@ -363,12 +504,36 @@ filter -p tcp -j throttle_lo
 # attach ingress policer:
 
 $TC qdisc add dev $UDEV ingress handle ffff:
+$TC filter add dev $UDEV parent ffff: protocol ip prio 30 \
+	u32 match ip dport 48003 0xffff police rate $[DOWNLINK/8]kbit \
+	burst 10k mtu 10k drop
+
+# backups
+# $TC class add dev $UDEV parent ffff: classid ffff:30 htb rate 8bps \
+#	ceil $[$DOWNLINK/2]kbit burst $burst quantum 1500
+
+# mangle "-p tcp --dport 48003" ffff:30
 
 # filter *everything* to it (0.0.0.0/0), drop everything that's
 # coming in too fast:
 
-$TC filter add dev $UDEV parent ffff: protocol ip prio 50 u32 match ip src \
-   0.0.0.0/0 police rate ${maxrate}kbit burst 10k drop flowid :1
+# limit backups to amazon to avoid being throttled by Virgin
+if false; then
+firsthour=17
+lasthour=22
+seconds=$[($lasthour - $firsthour) * 3600]
+allowance=$[3500*1000]
+maxrate=$[$allowance * 8 / $seconds]
+if [ $maxrate -gt $DOWNLINK ]; then
+	maxrate=$DOWNLINK
+fi
+
+if [ $hour -ge $firsthour -a $hour -lt $lasthour ]; then
+	$TC filter add dev $UDEV parent ffff: protocol ip prio 50 \
+		u32 match ip src 0.0.0.0/0 police rate ${maxrate}kbit \
+		burst 10k drop flowid :1
+fi
+fi
 
 ###### downlink to computers behind us
 
@@ -376,65 +541,73 @@ if true; then
 
 # install root HTB, point default traffic to 1:130 (bulk)
 
-$TC qdisc add dev $DDEV root handle 1: htb default 130
+$TC qdisc add dev $DDEV root handle 1: htb default $q_general
 
 # shape everything at $DOWNLINK2 speed - this prevents huge queues in your
 # DSL modem which destroy latency:
 
-$TC class add dev $DDEV parent 1: classid 1:1 htb rate 100mbit \
-	ceil 100mbit burst 6k quantum 1500
+$TC class add dev $DDEV parent 1: classid 1:1 htb rate ${DOWNLINK}kbit \
+	ceil ${DOWNLINK}kbit burst $burst quantum 1500
 
-$TC class add dev $DDEV parent 1:1 classid 1:10 htb rate ${DOWNLINK2}kbit \
-	ceil ${DOWNLINK2}kbit burst 6k quantum 1500
-
-$TC class add dev $DDEV parent 1:1 classid 1:11 htb rate 100mbit \
-	ceil 100mbit burst 6k quantum 1500
+$TC class add dev $DDEV parent 1: classid 1:$q_local htb rate 100mbit \
+	ceil 100mbit burst $burst quantum 1500
 
 # high prio class 1:10:
 
-$TC class add dev $DDEV parent 1:10 classid 1:110 htb rate $[${DOWNLINK2}/4]kbit \
-   ceil ${DOWNLINK2}kbit burst 6k prio 1 quantum 1500
+$TC class add dev $DDEV parent 1:1 classid 1:$q_hiprio htb rate $[${DOWNLINK2}/4]kbit \
+   ceil ${DOWNLINK}kbit burst $burst prio 1 quantum 1500
 
 # bulk & default class 1:20 - gets slightly less traffic, 
 # and a lower priority:
 
-$TC class add dev $DDEV parent 1:10 classid 1:120 htb \
-	rate 8bps ceil ${DOWNLINK2}kbit burst 2k prio 2 quantum 1500
+$TC class add dev $DDEV parent 1:1 classid 1:$q_general htb \
+	rate 8bps ceil ${DOWNLINK}kbit burst $burst prio 2 quantum 1500
 
-$TC class add dev $DDEV parent 1:10 classid 1:130 htb \
-	rate 8bps ceil ${bulkrate}kbit burst 2k prio 3 quantum 1500
+$TC class add dev $DDEV parent 1:1 classid 1:$q_backups htb \
+	rate 8bps ceil ${DOWNLINK}kbit burst $burst prio 3 quantum 1500
 
-$TC class add dev $DDEV parent 1:10 classid 1:140 htb \
-	rate 8bps ceil $[${bulkrate}/2]kbit burst 2k prio 3 quantum 1500
+$TC class add dev $DDEV parent 1:1 classid 1:$q_unknown htb \
+	rate 8bps ceil $[${DOWNLINK}/2]kbit burst $burst prio 3 quantum 1500
 
 # all get Stochastic Fairness:
-$TC qdisc add dev $DDEV parent 1:110 handle 10: sfq perturb 10
-$TC qdisc add dev $DDEV parent 1:120 handle 20: sfq perturb 10
-$TC qdisc add dev $DDEV parent 1:130 handle 30: sfq perturb 10
-$TC qdisc add dev $DDEV parent 1:140 handle 40: sfq perturb 10
+#$TC qdisc add dev $DDEV parent 1:110 handle 10: sfq perturb $perturb
+#$TC qdisc add dev $DDEV parent 1:$q_general handle $q_general: bfifo limit 200000
+$TC qdisc add dev $DDEV parent 1:$q_general handle $q_general: red limit 100000 min 10000 max 25000 avpkt 1000 burst 10 bandwidth ${DOWNLINK}kbit
+#$TC qdisc add dev $DDEV parent 1:130 handle 30: sfq perturb $perturb
+#$TC qdisc add dev $DDEV parent 1:140 handle 40: sfq perturb $perturb
 
-# default is bulk (1:30)
-
-mangle "-o $DDEV" 130
+classify local "-o $DDEV -s 192.168.0.1" # local
+classify local "-o $DDEV -s gcc.flexdns.net" # local
 
 # TOS Minimum Delay (ssh, NOT scp) in 1:110:
 
-mangle "-o $DDEV -m tos --tos 0x10" 110 # interactive
-mangle "-o $DDEV -m tos --tos 0x08" 130 # bulk
+classify general "-o $DDEV -p tcp --sport 80"
+classify general "-o $DDEV -p tcp --sport 443"
+classify hiprio "-o $DDEV -p tcp --sport 5903" # vnc
+classify general "-o $DDEV -p tcp --sport imaps"
+classify general "-o $DDEV -p tcp --sport imap"
+classify general "-o $DDEV -p tcp --sport smtp"
+classify hiprio "-o $DDEV -p udp -m length --length 0:100" # voip
+classify hiprio "-o $DDEV -p tcp -m length --length 0:100" # TCP acks
 
-mangle "-o $DDEV -p tcp --sport 80" 120
-mangle "-o $DDEV -p tcp --sport 443" 120
-mangle "-o $DDEV -p tcp --sport 5903" 110 # vnc
-mangle "-o $DDEV -p tcp --sport imaps" 120
-mangle "-o $DDEV -p tcp --sport imap" 120
-mangle "-o $DDEV -p tcp --sport smtp" 120
-mangle "-o $DDEV -p udp -m length --length 0:100" 110 # voip
-mangle "-o $DDEV -p tcp -m length --length 0:100" 110 # TCP acks
-mangle "-o $DDEV -s 192.168.0.1" 11 # local
+# icmp goes to different classes depending on TOS, 1:123 by default
+# ping -Q16 tests low latency, ping -Q0 tests normal traffic, ping -Q8 tests low priority
+classify hiprio "-o $DDEV -p icmp -m tos --tos Minimize-Delay"       # 0x10
+classify hiprio "-o $DDEV -p icmp -m tos --tos Maximize-Reliability" # 0x4
+classify general "-o $DDEV -p icmp -m tos --tos Normal-Service"       # 0x0
+classify backups "-o $DDEV -p icmp -m tos --tos Maximize-Throughput"  # 0x8
+classify unknown "-o $DDEV -p icmp -m tos --tos Minimize-Cost"        # 0x2
+
+classify hiprio "-o $DDEV -m tos --tos 0x10" # interactive
+classify backups "-o $DDEV -m tos --tos 0x08" # bulk
+classify backups "-o $DDEV -p tcp --dport 51413" # bittorrent
+classify backups "-o $DDEV -p udp --dport 51413" # bittorrent
+
+classify general "-o $DDEV"
 
 # eric bulk
-mangle "-o $DDEV -d 192.168.0.175" 140 # eri
-mangle "-o $DDEV -d 192.168.0.115" 140 # rob
+# mangle "-o $DDEV -d 192.168.0.175" 140 # eri
+# mangle "-o $DDEV -d 192.168.0.115" 140 # rob
 
 # $TC filter add dev $DDEV parent 1:0 protocol ip prio 10 u32 \
 #       match ip tos 0x10 0xff  flowid 1:10
