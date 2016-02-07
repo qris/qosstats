@@ -1,4 +1,3 @@
-#!/bin/bash
 # Wonder Shaper
 # please read the README before filling out these values 
 #
@@ -58,6 +57,10 @@ UDEV=eth0
 
 # Parameters for second network interface
 DDEV=eth1
+
+EC2="107.20.0.0/14 50.16.0.0/14 54.230.0.0/15 174.129.0.0/16"
+
+DOWNLINK2=$[$DOWNLINK*8/10]
 UPLINK2=$[$UPLINK*9/10]
 burst=1k
 perturb=60
@@ -141,7 +144,7 @@ $iptables -t filter -L blocked > $old_blocked
 
 $iptables -t nat -F blocked
 $iptables -t filter -F blocked
-$iptables -t filter -F throttle
+# $iptables -t filter -F throttle
 
 if [ "$1" = "stop" ] 
 then 
@@ -187,8 +190,8 @@ AND   ip_dst <> "192.168.0.113"
 AND   ip_src <> "192.168.0.1"
 AND   bytes < 100000000
 GROUP BY ip_dst
-HAVING b > 1600000000;
-' | mysql pmacct -u root -N | while read ip bytes direction; do
+HAVING b > 1000000000;
+' | mysql pmacct -u pmacct -pg,kmesnyrxtkxbse -N | while read ip bytes direction; do
 	blocking="$blocking : blocking $ip for $bytes bytes $direction"
 	$iptables -A blocked -s $ip -d 192.168.0.1 -p tcp \
 		-m multiport --dports 53,81 -j ACCEPT
@@ -288,11 +291,6 @@ $TC class add dev $UDEV parent 1:1 classid 1:$q_unknown htb \
 
 # iptables='/usr/local/sbin/iptables'
 $iptables -t mangle -F
-
-mangle() {
-	$iptables -t mangle -A POSTROUTING $1 -j CLASSIFY --set-class 1:$2
-	# $iptables -t mangle -A POSTROUTING $1 -j MARK --set-mark 0x$2
-}
 
 create_classify_chain() {
     name="classify_$1"
